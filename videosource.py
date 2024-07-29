@@ -3,14 +3,12 @@ import torch
 from openvoice import se_extractor
 from openvoice.api import ToneColorConverter
 import whisper
-from moviepy.editor import *
+from moviepy.editor import VideoFileClip
 from pydub import AudioSegment
 from df.enhance import enhance, init_df, load_audio, save_audio
-from df.utils import download_file
 import translators as ts
-from summarizer import Summarizer
 from melo.api import TTS
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import ffmpeg
 
 # Initialize paths and devices
@@ -51,6 +49,9 @@ sttresult = sttmodel.transcribe(reference_speaker, verbose=True)
 print(sttresult["text"])
 print(sttresult["language"])
 
+# Get the segments with start and end times
+segments = sttresult['segments']
+
 # Choose the target language for translation
 language = 'EN_NEWEST'
 valid = False
@@ -81,8 +82,8 @@ def translate_segment(segment):
 # Batch translation to reduce memory load
 batch_size = 2
 translation_segments = []
-for i in range(0, len(sttresult['segments']), batch_size):
-    batch = sttresult['segments'][i:i + batch_size]
+for i in range(0, len(segments), batch_size):
+    batch = segments[i:i + batch_size]
     with ThreadPoolExecutor(max_workers=5) as executor:
         batch_translations = list(executor.map(translate_segment, batch))
     translation_segments.extend(batch_translations)
@@ -112,7 +113,7 @@ def generate_segment_audio(segment, speaker_id):
     start, end, translated_text = segment
     segment_path = os.path.join(output_dir, f'segment_{start}_{end}.wav')
     model.tts_to_file(translated_text, speaker_id, segment_path, speed=speed)
-    return segment_path
+    return segment_path, start, end
 
 for speaker_key in speaker_ids.keys():
     speaker_id = speaker_ids[speaker_key]
@@ -122,15 +123,26 @@ for speaker_key in speaker_ids.keys():
 
     segment_files = []
     for segment in translation_segments:
-        segment_file = generate_segment_audio(segment, speaker_id)
-        segment_files.append(segment_file)
+        segment_file, start, end = generate_segment_audio(segment, speaker_id)
+        segment_files.append((segment_file, start, end))
 
     # Combine the audio segments
     combined_audio = AudioSegment.empty()
-    for segment_file in segment_files:
+    video_segments = []
+    for segment_file, start, end in segment_files:
         segment_audio = AudioSegment.from_file(segment_file)
         combined_audio += segment_audio
-        os.remove(segment_file)
+        
+        # Calculate the duration of the audio segment
+        audio_duration = len(segment_audio) / 1000.0
+
+        # Get the corresponding video segment and adjust its speed to match the audio duration
+        video_segment = (
+            ffmpeg
+            .input(reference_video.filename, ss=start, to=end)
+            .filter('setpts', f'PTS / {(end - start) / audio_duration}')
+        )
+        video_segments.append((video_segment, ffmpeg.input(segment_file)))
 
     save_path = os.path.join(output_dir, f'output_v2_{speaker_key}.wav')
     combined_audio.export(save_path, format="wav")
@@ -144,17 +156,19 @@ for speaker_key in speaker_ids.keys():
         output_path=save_path,
         message=encode_message)
 
-    # Sync the translated audio with the original video
+    # Combine video and audio segments using ffmpeg
+    video_and_audio_files = [item for sublist in video_segments for item in sublist]
+    joined = (
+        ffmpeg
+        .concat(*video_and_audio_files, v=1, a=1)
+        .node
+    )
+
     final_video_path = os.path.join(output_dir, f'final_video_{speaker_key}.mp4')
     try:
         (
             ffmpeg
-            .concat(
-                ffmpeg.input(reference_video.filename),
-                ffmpeg.input(save_path),
-                v=1, a=1
-            )
-            .output(final_video_path)
+            .output(joined[0], joined[1], final_video_path, vcodec='libx264', acodec='aac')
             .run(overwrite_output=True)
         )
     except ffmpeg.Error as e:
@@ -165,16 +179,11 @@ for speaker_key in speaker_ids.keys():
 
     # Add subtitles to the video
     final_video_with_subs_path = os.path.join(output_dir, f'final_video_with_subs_{speaker_key}.mp4')
-    video = ffmpeg.input(final_video_path)
     try:
         (
             ffmpeg
-            .concat(
-                video.filter("subtitles", srt_path),
-                video.audio,
-                v=1, a=1
-            )
-            .output(final_video_with_subs_path)
+            .input(final_video_path)
+            .output(final_video_with_subs_path, vf=f"subtitles={srt_path}")
             .run(overwrite_output=True)
         )
     except ffmpeg.Error as e:
