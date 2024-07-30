@@ -72,8 +72,7 @@ while not valid:
         case 'ko':
             language = 'KR'
         case _:
-            print('Invalid language')
-            valid = False
+            language = 'EN_NEWEST'
 
 # Translate the transcription segment by segment
 def translate_segment(segment):
@@ -88,23 +87,6 @@ for i in range(0, len(segments), batch_size):
         batch_translations = list(executor.map(translate_segment, batch))
     translation_segments.extend(batch_translations)
 
-# Generate subtitles file in SRT format
-srt_path = os.path.join(output_dir, 'subtitles.srt')
-with open(srt_path, 'w', encoding='utf-8') as srt_file:
-    for i, (start, end, translated_text) in enumerate(translation_segments):
-        start_hours, start_minutes = divmod(int(start), 3600)
-        start_minutes, start_seconds = divmod(start_minutes, 60)
-        start_milliseconds = int((start * 1000) % 1000)
-
-        end_hours, end_minutes = divmod(int(end), 3600)
-        end_minutes, end_seconds = divmod(end_minutes, 60)
-        end_milliseconds = int((end * 1000) % 1000)
-
-        srt_file.write(f"{i+1}\n")
-        srt_file.write(f"{start_hours:02}:{start_minutes:02}:{start_seconds:02},{start_milliseconds:03} --> "
-                       f"{end_hours:02}:{end_minutes:02}:{end_seconds:02},{end_milliseconds:03}\n")
-        srt_file.write(f"{translated_text}\n\n")
-
 # Generate the translated audio for each segment
 model = TTS(language=language, device=device)
 speaker_ids = model.hps.data.spk2id
@@ -113,7 +95,7 @@ def generate_segment_audio(segment, speaker_id):
     start, end, translated_text = segment
     segment_path = os.path.join(output_dir, f'segment_{start}_{end}.wav')
     model.tts_to_file(translated_text, speaker_id, segment_path, speed=speed)
-    return segment_path, start, end
+    return segment_path, start, end, translated_text
 
 for speaker_key in speaker_ids.keys():
     speaker_id = speaker_ids[speaker_key]
@@ -122,19 +104,36 @@ for speaker_key in speaker_ids.keys():
     source_se = torch.load(f'checkpoints_v2/base_speakers/ses/{speaker_key}.pth', map_location=device)
 
     segment_files = []
+    subtitle_entries = []
     for segment in translation_segments:
-        segment_file, start, end = generate_segment_audio(segment, speaker_id)
-        segment_files.append((segment_file, start, end))
+        segment_file, start, end, translated_text = generate_segment_audio(segment, speaker_id)
+
+        # Run the tone color converter
+        encode_message = "@MyShell"
+        tone_color_converter.convert(
+        audio_src_path=segment_file,
+        src_se=source_se,
+        tgt_se=target_se,
+        output_path=segment_file,
+        message=encode_message)
+        
+        segment_files.append((segment_file, start, end, translated_text))
 
     # Combine the audio segments
     combined_audio = AudioSegment.empty()
     video_segments = []
-    for segment_file, start, end in segment_files:
+    previous_end = 0
+    subtitle_counter = 1
+    for segment_file, start, end, translated_text in segment_files:
         segment_audio = AudioSegment.from_file(segment_file)
         combined_audio += segment_audio
         
         # Calculate the duration of the audio segment
         audio_duration = len(segment_audio) / 1000.0
+
+        # Add the subtitle entry for this segment
+        subtitle_entries.append((subtitle_counter, previous_end, previous_end + audio_duration, translated_text))
+        subtitle_counter += 1
 
         # Get the corresponding video segment and adjust its speed to match the audio duration
         video_segment = (
@@ -143,18 +142,10 @@ for speaker_key in speaker_ids.keys():
             .filter('setpts', f'PTS / {(end - start) / audio_duration}')
         )
         video_segments.append((video_segment, ffmpeg.input(segment_file)))
+        previous_end += audio_duration
 
     save_path = os.path.join(output_dir, f'output_v2_{speaker_key}.wav')
     combined_audio.export(save_path, format="wav")
-
-    # Run the tone color converter
-    encode_message = "@MyShell"
-    tone_color_converter.convert(
-        audio_src_path=save_path,
-        src_se=source_se,
-        tgt_se=target_se,
-        output_path=save_path,
-        message=encode_message)
 
     # Combine video and audio segments using ffmpeg
     video_and_audio_files = [item for sublist in video_segments for item in sublist]
@@ -176,6 +167,24 @@ for speaker_key in speaker_ids.keys():
         print(e.stderr.decode('utf-8'))
 
     print(f"Final video without subtitles saved to: {final_video_path}")
+
+    # Generate subtitles file in SRT format
+    srt_path = os.path.join(output_dir, 'subtitles.srt')
+    with open(srt_path, 'w', encoding='utf-8') as srt_file:
+        for entry in subtitle_entries:
+            index, start, end, text = entry
+            start_hours, start_minutes = divmod(int(start), 3600)
+            start_minutes, start_seconds = divmod(start_minutes, 60)
+            start_milliseconds = int((start * 1000) % 1000)
+
+            end_hours, end_minutes = divmod(int(end), 3600)
+            end_minutes, end_seconds = divmod(end_minutes, 60)
+            end_milliseconds = int((end * 1000) % 1000)
+
+            srt_file.write(f"{index}\n")
+            srt_file.write(f"{start_hours:02}:{start_minutes:02}:{start_seconds:02},{start_milliseconds:03} --> "
+                           f"{end_hours:02}:{end_minutes:02}:{end_seconds:02},{end_milliseconds:03}\n")
+            srt_file.write(f"{text}\n\n")
 
     # Add subtitles to the video
     final_video_with_subs_path = os.path.join(output_dir, f'final_video_with_subs_{speaker_key}.mp4')
