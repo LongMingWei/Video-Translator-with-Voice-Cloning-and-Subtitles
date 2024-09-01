@@ -14,3 +14,4 @@
 
 # Sample screenshots
 
+![Video Translator with Voice Cloning](https://github.com/user-attachments/assets/7d863904-26bc-4ff5-9675-2e8269bf4314)
